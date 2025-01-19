@@ -23,24 +23,41 @@ namespace BinaryOperations {
 
   // wtf man
   ZyanU8* data_g;
+  arch_mode is64Bit;
 
-  void initBases(ZyanU8* data) { data_g = data; }
+  void initBases(ZyanU8* data, arch_mode is64) {
+    data_g = data;
+    is64Bit = is64;
+  }
 
+  int getBitness() { return is64Bit == X64 ? 64 : 32; }
   void getBases(ZyanU8** data) { *data = data_g; }
 
   const char* getName(uint64_t offset) {
     auto dosHeader = (win::dos_header_t*)data_g;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)data_g + dosHeader->e_lfanew);
-    auto rvaOffset = FileHelper::RvaToFileOffset(ntHeaders, offset);
+    auto ntHeaders = (const void*)((uint8_t*)data_g + dosHeader->e_lfanew);
+    auto rvaOffset = RvaToFileOffset(ntHeaders, offset);
     return (const char*)data_g + rvaOffset;
   }
+
   bool isImport(uint64_t addr) {
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    uint64_t imageBase;
+    if (is64Bit == X64) {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    } else {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    }
+
     APInt tmp;
-    auto dosHeader = (win::dos_header_t*)data_g;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)data_g + dosHeader->e_lfanew);
-    return readMemory(ntHeaders->optional_header.image_base + addr, 1, tmp);
+    return readMemory(imageBase + addr, 1, tmp);
   }
 
   DenseSet<uint64_t> MemWrites;
@@ -53,7 +70,7 @@ namespace BinaryOperations {
   // sections
   bool readMemory(uint64_t addr, unsigned byteSize, APInt& value) {
 
-    uint64_t mappedAddr = FileHelper::address_to_mapped_address(addr);
+    uint64_t mappedAddr = address_to_mapped_address(addr);
     uint64_t tempValue;
     if (mappedAddr > 0) {
       std::memcpy(&tempValue,
@@ -73,6 +90,98 @@ namespace BinaryOperations {
   // we will be executing
   void writeMemory();
 
+  uint64_t RvaToFileOffset(const void* ntHeadersBase, uint32_t rva) {
+    const auto* sectionHeader =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->get_sections()
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->get_sections();
+
+    int numSections =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->file_header.num_sections
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->file_header.num_sections;
+
+    for (int i = 0; i < numSections; i++, sectionHeader++) {
+      if (rva >= sectionHeader->virtual_address &&
+          rva <
+              (sectionHeader->virtual_address + sectionHeader->virtual_size)) {
+        return rva - sectionHeader->virtual_address +
+               sectionHeader->ptr_raw_data;
+      }
+    }
+    return 0;
+  }
+
+  uint64_t address_to_mapped_address(uint64_t rva) {
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    uint64_t imageBase;
+    if (is64Bit == X64) {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    } else {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    }
+
+    uint64_t address = rva - imageBase;
+    return RvaToFileOffset(ntHeadersBase, address);
+  }
+
+  uint64_t fileOffsetToRVA(uint64_t offset) {
+    if (!data_g) {
+      return 0; // Ensure data is initialized
+    }
+
+    // Get DOS header
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    // Determine NT headers based on architecture
+    uint64_t imageBase;
+    auto sectionHeader =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->get_sections()
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->get_sections();
+
+    int numSections =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->file_header.num_sections
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->file_header.num_sections;
+
+    imageBase =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->optional_header.image_base
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->optional_header.image_base;
+
+    // Iterate over section headers to find matching section
+    for (int i = 0; i < numSections; i++, sectionHeader++) {
+      if (offset >= sectionHeader->ptr_raw_data &&
+          offset <
+              (sectionHeader->ptr_raw_data + sectionHeader->size_raw_data)) {
+        return imageBase + offset - sectionHeader->ptr_raw_data +
+               sectionHeader->virtual_address;
+      }
+    }
+
+    return 0; // Offset not found in any section
+  }
+
 }; // namespace BinaryOperations
 
 void lifterClass::addValueReference(Value* value, uint64_t address) {
@@ -88,7 +197,8 @@ void lifterClass::addValueReference(Value* value, uint64_t address) {
 }
 
 Value* lifterClass::retrieveCombinedValue(uint64_t startAddress,
-                                          uint8_t byteCount, Value* orgLoad) {
+                                          uint8_t byteCount,
+                                          LazyValue orgLoad) {
   LLVMContext& context = builder.getContext();
   if (byteCount == 0) {
     return nullptr;
@@ -143,7 +253,12 @@ Value* lifterClass::retrieveCombinedValue(uint64_t startAddress,
       byteValue = builder.getIntN(bytesize * 8, mem_value.getZExtValue());
     } else if (!v.isRef) {
       // llvm_unreachable_internal("uh...");
-      byteValue = extractBytes(orgLoad, m, m + bytesize);
+	  /*
+      byteValue = ConstantInt::get(Type::getIntNTy(context, (bytesize) * 8),
+                                   v.memoryAddress);
+	  */
+      // TODO :
+      byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
     }
     if (byteValue) {
       printvalue(byteValue);
@@ -286,8 +401,7 @@ void lifterClass::pagedCheck(Value* address, Instruction* ctxI) {
   }
 }
 
-void lifterClass::loadMemoryOp(LoadInst* inst) {
-  auto ptr = inst->getPointerOperand();
+void lifterClass::loadMemoryOp(Value* ptr) {
   if (!isa<GetElementPtrInst>(ptr))
     return;
 
@@ -298,7 +412,7 @@ void lifterClass::loadMemoryOp(LoadInst* inst) {
 
   auto gepOffset = gepInst->getOperand(1);
 
-  pagedCheck(gepOffset, inst);
+  pagedCheck(gepOffset, dyn_cast<Instruction>(ptr));
   return;
 }
 
@@ -695,21 +809,15 @@ set<APInt, APIntComparator> lifterClass::computePossibleValues(Value* V,
   return res;
 }
 
-Value* lifterClass::solveLoad(LoadInst* load) {
-  printvalue(load);
+Value* lifterClass::solveLoad(LazyValue load, Value* ptr, uint8_t size) {
 
-  // replace this
-  auto LoadMemLoc = MemoryLocation::get(load);
+  const Value* loadPtr = ptr;
 
-  const Value* loadPtr = LoadMemLoc.Ptr;
-  LocationSize loadsize = LoadMemLoc.Size;
-
-  auto cloadsize = loadsize.getValue();
-
+  auto cloadsize = size / 8;
   auto loadPtrGEP = cast<GetElementPtrInst>(loadPtr);
-
   auto loadPointer = loadPtrGEP->getPointerOperand();
-  auto loadOffset = loadPtrGEP->getOperand(1);
+  Value* loadOffset = loadPtrGEP->getOperand(1);
+
   printvalue(loadOffset);
   // if we know all the stores, we can use our buffer
   // however, if we dont know all the stores
@@ -743,161 +851,9 @@ Value* lifterClass::solveLoad(LoadInst* load) {
                 cast<ConstantInt>(select_inst->getFalseValue())->getZExtValue(),
                 cloadsize, load));
     }
-    auto possibleValues = computePossibleValues(loadOffset, 0);
-
-    llvm::Value* selectedValue = nullptr;
-
-    for (auto possibleValue : possibleValues) { // rename
-
-      auto isPaged = isMemPaged(possibleValue.getZExtValue());
-      if (!isPaged)
-        continue;
-      printvalue2(possibleValue);
-      auto possible_values_from_mem =
-          retrieveCombinedValue(possibleValue.getZExtValue(), cloadsize, load);
-      printvalue2((uint64_t)cloadsize);
-      printvalue(possible_values_from_mem);
-
-      if (selectedValue == nullptr) {
-        selectedValue = possible_values_from_mem;
-      } else {
-
-        llvm::Value* comparison = createICMPFolder(
-            CmpInst::ICMP_EQ, loadOffset,
-            llvm::ConstantInt::get(loadOffset->getType(), possibleValue));
-        printvalue(comparison);
-        selectedValue =
-            createSelectFolder(comparison, possible_values_from_mem,
-                               selectedValue, "conditional-mem-load");
-      }
-    }
-    return selectedValue;
   }
 
-  // create a new vector with only leave what we care about
-  vector<Instruction*> clearedMemInfos;
-
-  clearedMemInfos = memInfos;
-  removeDuplicateOffsets(clearedMemInfos);
-
-  Value* retval = nullptr;
-
-  for (auto inst : clearedMemInfos) {
-
-    // we are only interested in previous instructions
-
-    // replace it with something more efficent
-    // auto MemLoc = MemoryLocation::get(inst);
-
-    StoreInst* storeInst = cast<StoreInst>(inst);
-    auto memLocationValue = storeInst->getPointerOperand();
-
-    auto memLocationGEP = cast<GetElementPtrInst>(memLocationValue);
-
-    auto pointer = memLocationGEP->getOperand(0);
-    auto offset = memLocationGEP->getOperand(1);
-
-    if (pointer != loadPointer)
-      break;
-
-    // find a way to compare with unk values, we are also interested
-    // when offset in unk ( should be a rare case )
-    if (!isa<ConstantInt>(offset) || !isa<ConstantInt>(loadOffset))
-      continue;
-
-    uint64_t memOffsetValue = cast<ConstantInt>(offset)->getZExtValue();
-    uint64_t loadOffsetValue = cast<ConstantInt>(loadOffset)->getZExtValue();
-
-    uint64_t diff = memOffsetValue - loadOffsetValue;
-
-    // this is bytesize, not bitsize
-    uint64_t storeBitSize =
-        storeInst->getValueOperand()->getType()->getIntegerBitWidth() / 8;
-
-    if (overlaps(loadOffsetValue, cloadsize, memOffsetValue, storeBitSize)) {
-
-      printvalue2(diff) printvalue2(memOffsetValue);
-      printvalue2(loadOffsetValue) printvalue2(storeBitSize);
-
-      auto storedInst = inst->getOperand(0);
-      if (!retval)
-        retval = ConstantInt::get(load->getType(), 0);
-
-      Value* mask = ConstantInt::get(
-          storedInst->getType(),
-          createmask(loadOffsetValue, loadOffsetValue + cloadsize,
-                     memOffsetValue, memOffsetValue + storeBitSize));
-
-      printvalue(mask);
-
-      // we dont have to calculate knownbits if its a constant
-      auto maskedinst =
-          createAndFolder(storedInst, mask, inst->getName() + ".maskedinst");
-
-      printvalue(storedInst);
-      printvalue(mask);
-      printvalue(maskedinst);
-      if (maskedinst->getType()->getScalarSizeInBits() <
-          retval->getType()->getScalarSizeInBits())
-        maskedinst = builder.CreateZExt(maskedinst, retval->getType());
-
-      if (mask->getType()->getScalarSizeInBits() <
-          retval->getType()->getScalarSizeInBits())
-        mask = builder.CreateZExt(mask, retval->getType());
-
-      printvalue(maskedinst);
-      printvalue2(diff);
-      // move the mask?
-      if (diff > 0) {
-        maskedinst = createShlFolder(maskedinst, (diff) * 8);
-        mask = createShlFolder(mask, (diff) * 8);
-      } else if (diff < 0) {
-        maskedinst = createLShrFolder(maskedinst, -(diff) * 8, "clevername");
-        mask = createLShrFolder(mask, -(diff) * 8, "stupidname");
-      }
-      // maskedinst = maskedinst
-      // maskedinst = 0x4433221100000000
-      printvalue(maskedinst);
-      maskedinst = builder.CreateZExtOrTrunc(maskedinst, retval->getType());
-      printvalue(maskedinst);
-
-      printvalue(mask);
-
-      // clear mask from retval so we can merge
-      // this will be a NOT operation for sure
-
-      auto reverseMask = builder.CreateNot(mask);
-
-      printvalue(reverseMask);
-
-      auto cleared_retval = createAndFolder(
-          retval, builder.CreateTrunc(reverseMask, retval->getType()),
-          retval->getName() + ".cleared");
-      // cleared_retval = 0 & 0; clear retval
-      // cleared_retval = retval & 0xff_ff_ff_ff_00_00_00_00
-
-      retval = createOrFolder(cleared_retval, maskedinst,
-                              cleared_retval->getName() + ".merged");
-      // retval = builder.CreateTrunc(retval, load->getType());
-      printvalue(cleared_retval);
-      printvalue(maskedinst);
-      // retval = cleared_retval | maskedinst =|= 0 |
-      // 0x1122334455667788 retval = cleared_retval | maskedinst =|=
-      // 0x55667788 | 0x4433221100000000
-
-      if (retval)
-        if (retval->getType()->getScalarSizeInBits() >
-            load->getType()->getScalarSizeInBits())
-          retval = builder.CreateTrunc(retval, load->getType());
-
-      printvalue(inst);
-      auto retvalload = retval;
-      printvalue(cleared_retval);
-      printvalue(retvalload);
-      debugging::doIfDebug([&]() { cout << "-------------------\n"; });
-    }
-  }
-  return retval;
+  return nullptr;
 }
 
 // some stuff about memory
